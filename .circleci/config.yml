@@ -46,6 +46,13 @@ references:
     yarn: &YARN_CACHE_KEY consul-ui-v9-{{ checksum "ui/yarn.lock" }}
 
 steps:
+  install-go-arm64: &install-go-arm64
+    name: install go
+    command: |
+      sudo rm -rf /usr/local/go
+      wget https://dl.google.com/go/go${GO_VERSION}.linux-arm64.tar.gz
+      sudo tar -C /usr/local -xzvf go${GO_VERSION}.linux-arm64.tar.gz
+
   install-gotestsum: &install-gotestsum
     name: install gotestsum
     environment:
@@ -372,6 +379,45 @@ jobs:
           path: /tmp/jsonfile
       - run: *notify-slack-failure
 
+  go-test-race-arm64:
+    machine:
+      image: *UBUNTU_CI_IMAGE
+    resource_class: arm.large
+    environment:
+      <<: *ENVIRONMENT
+      GOTAGS: "" # No tags for OSS but there are for enterprise
+      # GOMAXPROCS defaults to number of cores on underlying hardware, set
+      # explicitly to avoid OOM issues https://support.circleci.com/hc/en-us/articles/360034684273-common-GoLang-memory-issues
+      GOMAXPROCS: 4
+      # The medium resource class (default) boxes are 2 vCPUs, 4GB RAM
+      # https://circleci.com/docs/2.0/configuration-reference/#docker-executor
+      # but we can run a little over that limit.
+    steps:
+      - checkout
+      - run: *install-go-arm64
+      - run: go mod download
+      - run: *install-gotestsum
+      - run:
+          name: go test -race
+          command: |
+            mkdir -p $TEST_RESULTS_DIR /tmp/jsonfile
+            pkgs="$(go list ./... | \
+              grep -E -v '^github.com/hashicorp/consul/agent(/consul|/local|/routine-leak-checker)?$' | \
+              grep -E -v '^github.com/hashicorp/consul/command/')"
+            gotestsum \
+              --jsonfile /tmp/jsonfile/go-test-race.log \
+              --junitfile $TEST_RESULTS_DIR/gotestsum-report.xml -- \
+              -tags="$GOTAGS" -p 2 \
+              -race -gcflags=all=-d=checkptr=0 \
+              $pkgs
+      - store_test_results:
+          path: *TEST_RESULTS_DIR
+      - store_artifacts:
+          path: *TEST_RESULTS_DIR
+      - store_artifacts:
+          path: /tmp/jsonfile
+      - run: *notify-slack-failure
+
   # go-test-32bit is to catch problems where 64-bit ints must be 64-bit aligned
   # to use them with sync/atomic. See https://golang.org/pkg/sync/atomic/#pkg-note-BUG.
   # Running tests with GOARCH=386 seems to be the best way to detect this
@@ -442,6 +488,47 @@ jobs:
               -tags="$GOTAGS" -cover -coverprofile=coverage.txt \
               ./...
 
+      - store_test_results:
+          path: *TEST_RESULTS_DIR
+      - store_artifacts:
+          path: *TEST_RESULTS_DIR
+      - store_artifacts:
+          path: /tmp/jsonfile
+      - run: *notify-slack-failure
+
+  go-test-lib-arm64:
+    description: "test a library against a specific Go version on arm64"
+    parameters:
+      go-version:
+        type: string
+      path:
+        type: string
+    machine:
+      image: *UBUNTU_CI_IMAGE
+    resource_class: arm.large
+    environment:
+      <<: *ENVIRONMENT
+      GOTAGS: "" # No tags for OSS but there are for enterprise
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /home/circleci/go/bin
+      - run:
+          working_directory: <<parameters.path>>
+          command: go mod download
+      - run: *install-gotestsum
+      - run:
+          working_directory: <<parameters.path>>
+          name: go test
+          command: |
+            export PATH=/home/circleci/go/bin/:$PATH
+            mkdir -p $TEST_RESULTS_DIR /tmp/jsonfile
+            gotestsum \
+              --format=short-verbose \
+              --jsonfile /tmp/jsonfile/go-test-<<parameters.path>>.log \
+              --junitfile $TEST_RESULTS_DIR/gotestsum-report.xml -- \
+              -tags="$GOTAGS" -cover -coverprofile=coverage.txt \
+              ./...
       - store_test_results:
           path: *TEST_RESULTS_DIR
       - store_artifacts:
@@ -549,6 +636,30 @@ jobs:
             - consul
       - run: *notify-slack-failure
 
+  dev-build-arm64:
+    machine:
+      image: *UBUNTU_CI_IMAGE
+    resource_class: arm.large
+    environment:
+      <<: *ENVIRONMENT
+    steps:
+      - checkout
+      - attach_workspace: # this normally runs as the first job and has nothing to attach; only used in main branch after rebuilding UI
+          at: .
+      - run: *install-go-arm64
+      - run:
+          name: Build
+          command: |
+            make dev
+            mkdir -p /home/circleci/go/bin
+            cp ./bin/consul /home/circleci/go/bin/consul
+      # save dev build to pass to downstream jobs
+      - persist_to_workspace:
+          root: /home/circleci/go/bin
+          paths:
+            - consul
+      - run: *notify-slack-failure
+
   # upload development build to s3
   dev-upload-s3:
     docker:
@@ -625,6 +736,54 @@ jobs:
       - run:
           name: go test
           command: |
+            mkdir -p $TEST_RESULTS_DIR
+            gotestsum \
+              --format=short-verbose \
+              --junitfile $TEST_RESULTS_DIR/results.xml -- \
+              ./command/agent/consul -run TestConsul
+          working_directory: *NOMAD_WORKING_DIR
+
+      # store test results for CircleCI
+      - store_test_results:
+          path: *TEST_RESULTS_DIR
+      - store_artifacts:
+          path: *TEST_RESULTS_DIR
+      - run: *notify-slack-failure
+
+  nomad-integration-test-arm64: &NOMAD_TESTS
+    machine:
+      image: *UBUNTU_CI_IMAGE
+    resource_class: arm.large
+    parameters:
+      nomad-version:
+        type: enum
+        enum: *supported_nomad_versions
+        default: *default_nomad_version
+    environment:
+      <<: *ENVIRONMENT
+      NOMAD_WORKING_DIR: &NOMAD_WORKING_DIR /home/circleci/go/src/github.com/hashicorp/nomad
+      NOMAD_VERSION: << parameters.nomad-version >>
+    steps: &NOMAD_INTEGRATION_TEST_STEPS
+      - run: git clone https://github.com/hashicorp/nomad.git --branch v${NOMAD_VERSION} ${NOMAD_WORKING_DIR}
+
+      # get consul binary
+      - attach_workspace:
+          at: /home/circleci/go/bin
+
+      - run: *install-go-arm64
+
+      # make dev build of nomad
+      - run:
+          command: make pkg/linux_arm64/nomad
+          working_directory: *NOMAD_WORKING_DIR
+
+      - run: *install-gotestsum
+
+      # run integration tests
+      - run:
+          name: go test
+          command: |
+            export PATH=/home/circleci/go/bin/:$PATH
             mkdir -p $TEST_RESULTS_DIR
             gotestsum \
               --format=short-verbose \
@@ -886,6 +1045,60 @@ jobs:
           path: *TEST_RESULTS_DIR
       - run: *notify-slack-failure
 
+  compatibility-integration-test-arm64:
+    machine:
+      image: *UBUNTU_CI_IMAGE
+      docker_layer_caching: true
+    resource_class: arm.large
+    parallelism: 1
+    steps:
+      - checkout
+      # Get go binary from workspace
+      - attach_workspace:
+          at: .
+      # Build the consul:local image from the already built binary
+      - run:
+          command: |
+            sudo rm -rf /usr/local/go
+            wget https://dl.google.com/go/go${GO_VERSION}.linux-arm64.tar.gz
+            sudo tar -C /usr/local -xzvf go${GO_VERSION}.linux-arm64.tar.gz
+          environment:
+            <<: *ENVIRONMENT
+      - run: *install-gotestsum
+      - run: docker build -t consul:local -f ./build-support/docker/Consul-Dev.dockerfile .
+      - run:
+          name: Compatibility Integration Tests
+          command: |
+            mkdir -p /tmp/test-results/
+            cd ./test/integration/consul-container
+            docker run --rm consul:local consul version
+            gotestsum \
+              --format=short-verbose \
+              --debug \
+              --rerun-fails=3 \
+              --packages="./..." \
+              -- \
+              -timeout=30m \
+              ./... \
+              --target-version local \
+              --latest-version latest
+            ls -lrt
+          environment:
+            # this is needed because of incompatibility between RYUK container and circleci
+            GOTESTSUM_JUNITFILE: /tmp/test-results/results.xml
+            GOTESTSUM_FORMAT: standard-verbose
+            COMPOSE_INTERACTIVE_NO_CLI: 1
+            # tput complains if this isn't set to something.
+            TERM: ansi
+      - store_artifacts:
+          path: ./test/integration/consul-container/test/upgrade/workdir/logs
+          destination: container-logs
+      - store_test_results:
+          path: *TEST_RESULTS_DIR
+      - store_artifacts:
+          path: *TEST_RESULTS_DIR
+      - run: *notify-slack-failure
+
   envoy-integration-test: &ENVOY_TESTS
     machine:
       image: *UBUNTU_CI_IMAGE
@@ -963,6 +1176,39 @@ jobs:
             vault version
       - checkout
       - run: go mod download
+      - run:
+          name: go test
+          command: |
+            mkdir -p $TEST_RESULTS_DIR
+            make test-connect-ca-providers
+      - store_test_results:
+          path: *TEST_RESULTS_DIR
+      - run: *notify-slack-failure
+
+  vault-integration-test-arm64:
+    machine:
+      image: *UBUNTU_CI_IMAGE
+    resource_class: arm.large
+    parameters:
+      vault-version:
+        type: enum
+        enum: *supported_vault_versions
+        default: *default_vault_version
+    environment:
+      <<: *ENVIRONMENT
+      VAULT_BINARY_VERSION: << parameters.vault-version >>
+    steps: &VAULT_INTEGRATION_TEST_STEPS
+      - run:
+          name: Install vault
+          command: |
+            wget -q -O /tmp/vault.zip https://releases.hashicorp.com/vault/${VAULT_BINARY_VERSION}/vault_${VAULT_BINARY_VERSION}_linux_arm64.zip
+            sudo unzip -d /usr/local/bin /tmp/vault.zip
+            rm -rf /tmp/vault*
+            vault version
+      - checkout
+      - run: *install-go-arm64
+      - run: go mod download
+      - run: *install-gotestsum
       - run:
           name: go test
           command: |
@@ -1084,6 +1330,7 @@ workflows:
           <<: *filter-ignore-non-go-branches
       - go-test-arm64: *filter-ignore-non-go-branches
       - dev-build: *filter-ignore-non-go-branches
+      - dev-build-arm64: *filter-ignore-non-go-branches
       - go-test:
           requires: [dev-build]
       - go-test-lib:
@@ -1091,13 +1338,28 @@ workflows:
           path: api
           go-version: "1.18"
           requires: [dev-build]
+      - go-test-lib-arm64:
+          name: "go-test-api go1.18 on arm64"
+          path: api
+          go-version: "1.18"
+          requires: [dev-build-arm64]
       - go-test-lib:
           name: "go-test-api go1.19"
           path: api
           go-version: "1.19"
           requires: [dev-build]
+      - go-test-lib-arm64:
+          name: "go-test-api go1.19 on arm64"
+          path: api
+          go-version: "1.19"
+          requires: [dev-build-arm64]
       - go-test-lib:
           name: "go-test-sdk go1.18"
+          path: sdk
+          go-version: "1.18"
+          <<: *filter-ignore-non-go-branches
+      - go-test-lib-arm64:
+          name: "go-test-sdk go1.18 on arm64"
           path: sdk
           go-version: "1.18"
           <<: *filter-ignore-non-go-branches
@@ -1106,7 +1368,13 @@ workflows:
           path: sdk
           go-version: "1.19"
           <<: *filter-ignore-non-go-branches
+      - go-test-lib-arm64:
+          name: "go-test-sdk go1.19 on arm64"
+          path: sdk
+          go-version: "1.19"
+          <<: *filter-ignore-non-go-branches
       - go-test-race: *filter-ignore-non-go-branches
+      - go-test-race-arm64: *filter-ignore-non-go-branches
       - go-test-32bit: *filter-ignore-non-go-branches
       - noop
   build-distros:
@@ -1145,6 +1413,7 @@ workflows:
     unless: << pipeline.parameters.trigger-load-test >>
     jobs:
       - dev-build: *filter-ignore-non-go-branches
+      - dev-build-arm64: *filter-ignore-non-go-branches
       - dev-upload-s3: &dev-upload
           requires:
             - dev-build
@@ -1153,6 +1422,7 @@ workflows:
               ignore:
                 - /^pull\/.*$/ # only push dev builds from non forks
                 - main # all main dev uploads will include a UI rebuild in build-distros
+                - local
       - dev-upload-docker:
           <<: *dev-upload
           context: consul-ci
@@ -1162,7 +1432,18 @@ workflows:
           matrix:
             parameters:
               nomad-version: *supported_nomad_versions
+      - nomad-integration-test-arm64:
+          requires:
+            - dev-build-arm64
+          matrix:
+            parameters:
+              nomad-version: *supported_nomad_versions
       - vault-integration-test:
+          matrix:
+            parameters:
+              vault-version: *supported_vault_versions
+          <<: *filter-ignore-non-go-branches
+      - vault-integration-test-arm64:
           matrix:
             parameters:
               vault-version: *supported_vault_versions
@@ -1177,6 +1458,9 @@ workflows:
       - compatibility-integration-test:
           requires:
             - dev-build
+      - compatibility-integration-test-arm64:
+          requires:
+            - dev-build-arm64
       - noop
   frontend:
     unless: << pipeline.parameters.trigger-load-test >>
